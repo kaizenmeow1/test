@@ -3994,8 +3994,9 @@ do
 
     -- Zombie escape system
     local AUTOFARM_ZOMBIE_ESCAPE_RANGE  = 10   -- studs: if any zombie is this close, escape
-    local AUTOFARM_ESCAPE_FLOAT_HEIGHT  = 18   -- studs above zombie head to float to
+    local AUTOFARM_ESCAPE_FLOAT_HEIGHT  = 3    -- studs above zombie head (just out of reach)
     local _zombieEscapeActive           = false
+    local _zombieEscapeY                = 5    -- current Y target (updated live by watcher)
     local _zombieEscapeConn             = nil
 
     local AUTOFARM_STRUCTURES_PATH = Workspace:FindFirstChild("Structures")
@@ -4200,18 +4201,16 @@ do
 
             local step = math.min(dist, AUTOFARM_STEP_SIZE)
             local nextPos = hrp.Position + (finalPos - hrp.Position).Unit * step
-            local goalCFrame = CFrame.new(nextPos.X, AUTOFARM_TARGET_Y, nextPos.Z) * hrp.CFrame.Rotation
+            -- Use _zombieEscapeY so the tween naturally keeps the player above
+            -- any zombie head while still traveling toward the target.
+            local goalY = _zombieEscapeY
+            local goalCFrame = CFrame.new(nextPos.X, goalY, nextPos.Z) * hrp.CFrame.Rotation
             local duration = (hrp.Position - goalCFrame.Position).Magnitude / currentSpeed
 
             local info = TweenInfo.new(duration, Enum.EasingStyle.Linear)
             _autofarmTween = TweenService:Create(hrp, info, { CFrame = goalCFrame })
             _autofarmTween:Play()
             _autofarmTween.Completed:Wait()
-
-            -- Yield here until any zombie escape finishes before tweening again.
-            while _zombieEscapeActive and State.AutoFarmEmerald do
-                task.wait(0.1)
-            end
 
             if not State.AutoFarmEmerald then break end
         end
@@ -4241,8 +4240,10 @@ do
         return nil, nil
     end
 
-    -- Heartbeat watcher: instantly floats the player above any zombie that
-    -- steps within AUTOFARM_ZOMBIE_ESCAPE_RANGE while autofarm is running.
+    -- Heartbeat watcher: tracks the closest zombie and updates _zombieEscapeY live.
+    -- It never cancels tweens or blocks the farm loop — the tween loop reads
+    -- _zombieEscapeY each step so the player naturally flies just above zombie heads
+    -- while still traveling and triggering prompts.
     local function startZombieEscapeWatch()
         if _zombieEscapeConn then return end
         _zombieEscapeConn = RunService.Heartbeat:Connect(function()
@@ -4250,6 +4251,7 @@ do
                 _zombieEscapeConn:Disconnect()
                 _zombieEscapeConn = nil
                 _zombieEscapeActive = false
+                _zombieEscapeY = AUTOFARM_TARGET_Y
                 return
             end
 
@@ -4264,23 +4266,13 @@ do
             local _, zombieHead = getClosestZombieInRange(hrp.Position, rangeSq)
 
             if zombieHead then
-                -- Cancel any active tween so we stop moving toward the zombie.
-                if _autofarmTween then
-                    pcall(function() _autofarmTween:Cancel() end)
-                    _autofarmTween = nil
-                end
-                -- Float above the zombie's head so melee can't reach the player.
-                local escapeY = zombieHead.Position.Y + AUTOFARM_ESCAPE_FLOAT_HEIGHT
-                local cf = hrp.CFrame
-                hrp.CFrame = CFrame.new(cf.X, math.max(escapeY, AUTOFARM_TARGET_Y), cf.Z) * cf.Rotation
-                hrp.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+                -- Just raise the shared Y target — the tween loop picks it up
+                -- on its next step automatically, no stopping needed.
                 _zombieEscapeActive = true
-                updateAutofarmStatus("Zombie nearby! Floating to escape...")
+                _zombieEscapeY = zombieHead.Position.Y + AUTOFARM_ESCAPE_FLOAT_HEIGHT
             else
-                if _zombieEscapeActive then
-                    updateAutofarmStatus("Zombie gone. Resuming...")
-                end
                 _zombieEscapeActive = false
+                _zombieEscapeY = AUTOFARM_TARGET_Y
             end
         end)
     end
@@ -4374,12 +4366,6 @@ do
                 for i, entry in ipairs(boxes) do
                     if not State.AutoFarmEmerald then break end
 
-                    -- Wait out any active zombie escape before traveling to next box.
-                    if _zombieEscapeActive then
-                        while _zombieEscapeActive and State.AutoFarmEmerald do task.wait(0.15) end
-                        if not State.AutoFarmEmerald then break end
-                    end
-
                     local targetPos = getPowerBoxPosition(entry)
                     if not targetPos then continue end
 
@@ -4401,11 +4387,12 @@ do
                     hrp = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
                     if hrp then
                         hrp.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+                        local snapY = _zombieEscapeY
                         if getAutofarmFlatDistance(hrp.Position, targetPos) > getAutofarmRadius() then
                             local standPos = getAutofarmStandPosition(hrp.Position, targetPos)
-                            hrp.CFrame = CFrame.new(standPos.X, standPos.Y, standPos.Z) * hrp.CFrame.Rotation
+                            hrp.CFrame = CFrame.new(standPos.X, snapY, standPos.Z) * hrp.CFrame.Rotation
                         else
-                            hrp.CFrame = CFrame.new(hrp.Position.X, AUTOFARM_TARGET_Y, hrp.Position.Z) * hrp.CFrame.Rotation
+                            hrp.CFrame = CFrame.new(hrp.Position.X, snapY, hrp.Position.Z) * hrp.CFrame.Rotation
                         end
                     end
 
