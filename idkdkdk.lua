@@ -4197,6 +4197,85 @@ do
         return result ~= nil
     end
 
+    -- ── Zombie Avoidance ────────────────────────────────────────────────────────
+    -- How far (studs, flat/XZ plane) zombies start affecting movement direction.
+    local ZOMBIE_DANGER_RADIUS = 28
+    -- Below this distance the character hard-flees first before resuming travel.
+    local ZOMBIE_FLEE_RADIUS   = 10
+    -- How strongly avoidance steers relative to the goal direction (higher = wider arc).
+    local ZOMBIE_AVOID_WEIGHT  = 1.8
+
+    -- Returns: nearestDist (studs), combined avoidance vector (flat), zombie count
+    local function getZombieThreat(fromPos)
+        local nearestDist = math.huge
+        local avoidVec    = Vector3.zero
+        local count       = 0
+
+        -- Reuse the AuraTargetData table that is already kept up-to-date by the
+        -- existing zombie-tracking system — no extra scanning needed.
+        for model, data in pairs(AuraTargetData) do
+            if data.Dead then continue end
+            local root = model:FindFirstChild("HumanoidRootPart")
+            if not root then continue end
+
+            -- Flat distance only (ignore Y — zombies on different floors don't matter)
+            local zPos = root.Position
+            local dx   = fromPos.X - zPos.X
+            local dz   = fromPos.Z - zPos.Z
+            local dist = math.sqrt(dx * dx + dz * dz)
+
+            if dist < ZOMBIE_DANGER_RADIUS then
+                count += 1
+                if dist < nearestDist then nearestDist = dist end
+                -- Inverse-square weighting: much stronger push when very close
+                local t = (ZOMBIE_DANGER_RADIUS - dist) / ZOMBIE_DANGER_RADIUS
+                local weight = t * t
+                local mag = math.sqrt(dx * dx + dz * dz)
+                if mag > 0.01 then
+                    avoidVec = avoidVec + Vector3.new(dx / mag, 0, dz / mag) * weight
+                end
+            end
+        end
+
+        return nearestDist, avoidVec, count
+    end
+
+    -- Blend a goal direction and an avoidance vector into one unit direction.
+    local function blendDirection(goalDir, avoidVec, zombieCount)
+        if zombieCount == 0 or avoidVec.Magnitude < 0.01 then
+            return goalDir
+        end
+        local blended = goalDir + avoidVec.Unit * ZOMBIE_AVOID_WEIGHT
+        local mag = blended.Magnitude
+        return mag > 0.01 and blended / mag or goalDir
+    end
+
+    -- Move straight away from zombies until the nearest one is > ZOMBIE_FLEE_RADIUS.
+    -- Returns true when safe, false if AutoFarmEmerald was turned off.
+    local function fleeFromZombies(hrp, STEP_WAIT)
+        local fledFor = 0
+        while State.AutoFarmEmerald and hrp and hrp.Parent do
+            local nearestDist, avoidVec, count = getZombieThreat(hrp.Position)
+            if count == 0 or nearestDist >= ZOMBIE_FLEE_RADIUS then break end
+
+            local fleeDir = avoidVec.Magnitude > 0.01 and avoidVec.Unit
+                            or Vector3.new(1, 0, 0)  -- fallback if zombie is on top
+
+            local step    = AUTOFARM_NORMAL_SPEED * STEP_WAIT
+            local nextPos = hrp.Position + fleeDir * step
+            setAutofarmNoclip(true)
+            hrp.CFrame = CFrame.new(nextPos.X, AUTOFARM_TARGET_Y, nextPos.Z) * hrp.CFrame.Rotation
+            hrp.AssemblyLinearVelocity = Vector3.zero
+
+            task.wait(STEP_WAIT)
+            fledFor += STEP_WAIT
+            -- Safety cap: if we've been fleeing for 4 s just resume
+            if fledFor > 4 then break end
+        end
+        return State.AutoFarmEmerald
+    end
+    -- ─────────────────────────────────────────────────────────────────────────────
+
     local function adaptiveTweenToPosition(targetPos)
         local char = LocalPlayer.Character
         local hrp = char and char:FindFirstChild("HumanoidRootPart")
@@ -4208,24 +4287,49 @@ do
             _autofarmTween = nil
         end
 
-        -- Use direct CFrame stepping instead of a new Tween every 2 studs.
-        -- This is far lighter on the CPU/GPU, especially on mobile devices.
-        local STEP_WAIT = isTouch and 0.06 or 0.04  -- slightly longer yield on mobile
+        -- Direct CFrame stepping — far lighter than per-step Tween creation.
+        -- Mobile gets a slightly longer yield (0.06 s) to ease CPU pressure.
+        local STEP_WAIT = isTouch and 0.06 or 0.04
+
         while State.AutoFarmEmerald and hrp and hrp.Parent do
             local radius = getAutofarmRadius()
             if getAutofarmFlatDistance(hrp.Position, targetPos) <= radius then break end
 
             local finalPos = getAutofarmStandPosition(hrp.Position, targetPos)
-            local dist = (hrp.Position - finalPos).Magnitude
+            local toFinal  = finalPos - hrp.Position
+            local dist     = toFinal.Magnitude
             if dist <= AUTOFARM_ARRIVE_DIST then break end
+
+            -- ── Zombie check ────────────────────────────────────────────────────
+            local nearestZombie, avoidVec, zombieCount = getZombieThreat(hrp.Position)
+
+            if nearestZombie < ZOMBIE_FLEE_RADIUS then
+                -- Too close — flee first, then resume travel to the same target
+                updateAutofarmStatus("⚠ Zombie too close! Evading...")
+                local safe = fleeFromZombies(hrp, STEP_WAIT)
+                if not safe then break end
+                -- Re-fetch hrp in case character respawned during flee
+                hrp = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+                if not hrp then break end
+                updateAutofarmStatus("Safe — resuming travel...")
+                continue  -- recalculate direction from new position
+            end
+            -- ────────────────────────────────────────────────────────────────────
 
             local blocked = isAutofarmPathBlocked(hrp, finalPos)
             setAutofarmNoclip(blocked)
 
-            local speed = blocked and AUTOFARM_CLIPPING_SPEED or AUTOFARM_NORMAL_SPEED
-            local step = math.min(dist, speed * STEP_WAIT)
-            local dir = (finalPos - hrp.Position)
-            local nextPos = hrp.Position + dir.Unit * step
+            local speed   = blocked and AUTOFARM_CLIPPING_SPEED or AUTOFARM_NORMAL_SPEED
+            local step    = math.min(dist, speed * STEP_WAIT)
+
+            -- Blend goal direction with zombie avoidance to steer around threats
+            local goalDir   = toFinal.Magnitude > 0.01 and toFinal.Unit or Vector3.new(0, 0, 1)
+            local moveDir   = blendDirection(
+                Vector3.new(goalDir.X, 0, goalDir.Z),
+                avoidVec, zombieCount
+            )
+
+            local nextPos = hrp.Position + moveDir * step
             hrp.CFrame = CFrame.new(nextPos.X, AUTOFARM_TARGET_Y, nextPos.Z) * hrp.CFrame.Rotation
             hrp.AssemblyLinearVelocity = Vector3.zero
 
@@ -4311,11 +4415,47 @@ do
                     updateAutofarmStatus(string.format("At %s - Triggering prompt...", entry.Tile.Name))
 
                     -- Fire the repair prompt in a tight loop until it disappears (repaired)
-                    -- or the timeout expires. Mobile gets a slightly longer wait per tick
-                    -- to avoid overloading a low-end CPU.
+                    -- or the timeout expires. If a zombie rushes in while repairing, flee
+                    -- and then come BACK to the same box (not skip to next).
                     local promptFireWait = isTouch and 0.2 or 0.12
                     local promptStart = os_clock()
                     while State.AutoFarmEmerald and (os_clock() - promptStart) < AUTOFARM_WAIT_TIME do
+                        -- ── Mid-repair zombie check ──────────────────────────────────
+                        local nearestMidRepair, _, _ = getZombieThreat(
+                            LocalPlayer.Character
+                            and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+                            and LocalPlayer.Character:FindFirstChild("HumanoidRootPart").Position
+                            or Vector3.zero
+                        )
+                        if nearestMidRepair < ZOMBIE_FLEE_RADIUS then
+                            updateAutofarmStatus(string.format(
+                                "⚠ Zombie interrupted %s repair! Evading then returning...",
+                                entry.Tile.Name
+                            ))
+                            local hrpMid = LocalPlayer.Character
+                                and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+                            if hrpMid then
+                                fleeFromZombies(hrpMid, isTouch and 0.06 or 0.04)
+                            end
+                            -- Return to the power box and continue the repair loop
+                            adaptiveTweenToPosition(targetPos)
+                            setAutofarmNoclip(true)
+                            local hrpBack = LocalPlayer.Character
+                                and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+                            if hrpBack then
+                                hrpBack.AssemblyLinearVelocity = Vector3.zero
+                                hrpBack.CFrame = CFrame.new(
+                                    hrpBack.Position.X, AUTOFARM_TARGET_Y, hrpBack.Position.Z
+                                ) * hrpBack.CFrame.Rotation
+                            end
+                            updateAutofarmStatus(string.format(
+                                "Returned to %s - resuming repair...", entry.Tile.Name
+                            ))
+                            -- Reset the timeout so we get a full repair window again
+                            promptStart = os_clock()
+                        end
+                        -- ────────────────────────────────────────────────────────────
+
                         local prompt = findPromptInPowerBox(entry.PowerBox)
                         if not prompt or not prompt.Enabled then
                             updateAutofarmStatus(string.format("%s repaired! Moving on...", entry.Tile.Name))
