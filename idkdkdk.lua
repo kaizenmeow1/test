@@ -3992,13 +3992,6 @@ do
     local _autofarmStatusLabel    = nil
     local _autofarmRunning        = false
 
-    -- Zombie escape system
-    local AUTOFARM_ZOMBIE_ESCAPE_RANGE  = 10   -- studs: if any zombie is this close, escape
-    local AUTOFARM_ESCAPE_FLOAT_HEIGHT  = 3    -- studs above zombie head (just out of reach)
-    local _zombieEscapeActive           = false
-    local _zombieEscapeY                = 5    -- current Y target (updated live by watcher)
-    local _zombieEscapeConn             = nil
-
     local AUTOFARM_STRUCTURES_PATH = Workspace:FindFirstChild("Structures")
 
     local POWER_PLANT_NAMES = {
@@ -4133,14 +4126,43 @@ do
         return true
     end
 
-    local function setAutofarmNoclip(state)
+    -- Cached list of character BaseParts for noclip toggling
+    local _noclipParts = {}
+    local _noclipChar = nil
+
+    local function refreshNoclipParts()
         local char = LocalPlayer.Character
+        if char == _noclipChar then return end
+        _noclipChar = char
+        table.clear(_noclipParts)
         if not char then return end
         for _, p in ipairs(char:GetDescendants()) do
             if p:IsA("BasePart") then
+                _noclipParts[#_noclipParts + 1] = p
+            end
+        end
+    end
+
+    local function setAutofarmNoclip(state)
+        refreshNoclipParts()
+        for _, p in ipairs(_noclipParts) do
+            if p and p.Parent then
                 p.CanCollide = not state
             end
         end
+    end
+
+    -- Robust prompt check: retries a few times to handle game-server lag before deciding
+    -- a box is "already repaired". This fixes the bug where the bot skips boxes that
+    -- actually need repairing because the prompt hadn't loaded yet.
+    local function waitForPrompt(powerBox, timeoutSecs)
+        local deadline = os_clock() + (timeoutSecs or 1.2)
+        while os_clock() < deadline do
+            local p = findPromptInPowerBox(powerBox)
+            if p and p.Enabled then return p end
+            task.wait(0.12)
+        end
+        return nil
     end
 
     local function updateAutofarmStatus(text)
@@ -4151,21 +4173,27 @@ do
         end
     end
 
+    -- Cached RaycastParams for path-block check (avoids allocating a new object every step)
+    local _autofarmRayParams = RaycastParams.new()
+    _autofarmRayParams.FilterType = Enum.RaycastFilterType.Exclude
+    local _autofarmRayParamsChar = nil  -- track which character we last built params for
+
+    local function refreshAutofarmRayParams()
+        local char = LocalPlayer.Character
+        if char == _autofarmRayParamsChar then return end
+        _autofarmRayParamsChar = char
+        local filterList = {}
+        if char then filterList[#filterList + 1] = char end
+        if AUTOFARM_STRUCTURES_PATH then filterList[#filterList + 1] = AUTOFARM_STRUCTURES_PATH end
+        _autofarmRayParams.FilterDescendantsInstances = filterList
+    end
+
     local function isAutofarmPathBlocked(hrp, targetPos)
         local origin = hrp.Position
         local delta = targetPos - origin
         if delta.Magnitude <= 0.05 then return false end
-        local direction = delta.Unit * 4
-
-        local rayParams = RaycastParams.new()
-        local filterList = { LocalPlayer.Character }
-        if AUTOFARM_STRUCTURES_PATH then
-            filterList[#filterList + 1] = AUTOFARM_STRUCTURES_PATH
-        end
-        rayParams.FilterDescendantsInstances = filterList
-        rayParams.FilterType = Enum.RaycastFilterType.Exclude
-
-        local result = Workspace:Raycast(origin, direction, rayParams)
+        refreshAutofarmRayParams()
+        local result = Workspace:Raycast(origin, delta.Unit * 4, _autofarmRayParams)
         return result ~= nil
     end
 
@@ -4174,153 +4202,43 @@ do
         local hrp = char and char:FindFirstChild("HumanoidRootPart")
         if not hrp then return false end
 
-        -- Cache the stand position ONCE using the initial approach direction.
-        -- Recomputing it every step causes direction flips when the player is
-        -- almost at the target, making them tween backward ("backing" bug).
-        local cachedFinalPos = getAutofarmStandPosition(hrp.Position, targetPos)
+        -- Cancel any lingering tween before we start direct movement
+        if _autofarmTween then
+            pcall(function() _autofarmTween:Cancel() end)
+            _autofarmTween = nil
+        end
 
+        -- Use direct CFrame stepping instead of a new Tween every 2 studs.
+        -- This is far lighter on the CPU/GPU, especially on mobile devices.
+        local STEP_WAIT = isTouch and 0.06 or 0.04  -- slightly longer yield on mobile
         while State.AutoFarmEmerald and hrp and hrp.Parent do
             local radius = getAutofarmRadius()
-            -- Break as soon as we are within the repair radius (with a small buffer
-            -- so we stop before reaching the cached stand pos and never overshoot).
             if getAutofarmFlatDistance(hrp.Position, targetPos) <= radius then break end
 
-            local finalPos = cachedFinalPos
+            local finalPos = getAutofarmStandPosition(hrp.Position, targetPos)
             local dist = (hrp.Position - finalPos).Magnitude
             if dist <= AUTOFARM_ARRIVE_DIST then break end
 
-            -- If we somehow overshot past the stand position stop immediately.
-            local toTarget = getAutofarmFlatDistance(hrp.Position, targetPos)
-            local toFinal  = getAutofarmFlatDistance(hrp.Position, Vector3.new(finalPos.X, hrp.Position.Y, finalPos.Z))
-            if toFinal > toTarget then break end   -- we're already closer than the stand pos
-
             local blocked = isAutofarmPathBlocked(hrp, finalPos)
-            local currentSpeed = blocked and AUTOFARM_CLIPPING_SPEED or AUTOFARM_NORMAL_SPEED
-
             setAutofarmNoclip(blocked)
 
-            local step = math.min(dist, AUTOFARM_STEP_SIZE)
-            local nextPos = hrp.Position + (finalPos - hrp.Position).Unit * step
-            -- Use _zombieEscapeY so the tween naturally keeps the player above
-            -- any zombie head while still traveling toward the target.
-            local goalY = _zombieEscapeY
-            local goalCFrame = CFrame.new(nextPos.X, goalY, nextPos.Z) * hrp.CFrame.Rotation
-            local duration = (hrp.Position - goalCFrame.Position).Magnitude / currentSpeed
+            local speed = blocked and AUTOFARM_CLIPPING_SPEED or AUTOFARM_NORMAL_SPEED
+            local step = math.min(dist, speed * STEP_WAIT)
+            local dir = (finalPos - hrp.Position)
+            local nextPos = hrp.Position + dir.Unit * step
+            hrp.CFrame = CFrame.new(nextPos.X, AUTOFARM_TARGET_Y, nextPos.Z) * hrp.CFrame.Rotation
+            hrp.AssemblyLinearVelocity = Vector3.zero
 
-            local info = TweenInfo.new(duration, Enum.EasingStyle.Linear)
-            _autofarmTween = TweenService:Create(hrp, info, { CFrame = goalCFrame })
-            _autofarmTween:Play()
-            _autofarmTween.Completed:Wait()
-
+            task.wait(STEP_WAIT)
             if not State.AutoFarmEmerald then break end
         end
 
         return State.AutoFarmEmerald
     end
 
-    -- Returns the closest zombie model and its head if within rangeSq.
-    local function getClosestZombieInRange(hrpPos, rangeSq)
-        refreshAuraTargetCache(false)
-        for i = 1, #AuraTargets do
-            local data = AuraTargets[i]
-            local model = data and data.Model
-            if model and model.Parent and SupportedTypes[model.Name] then
-                local hum, head = cacheAuraTargetParts(data)
-                if hum and hum.Health > 0 and head then
-                    local hp = head.Position
-                    local dx = hp.X - hrpPos.X
-                    local dy = hp.Y - hrpPos.Y
-                    local dz = hp.Z - hrpPos.Z
-                    if (dx*dx + dy*dy + dz*dz) <= rangeSq then
-                        return model, head
-                    end
-                end
-            end
-        end
-        return nil, nil
-    end
-
-    -- Heartbeat watcher: tracks the closest zombie and updates _zombieEscapeY live.
-    -- It never cancels tweens or blocks the farm loop — the tween loop reads
-    -- _zombieEscapeY each step so the player naturally flies just above zombie heads
-    -- while still traveling and triggering prompts.
-    local function startZombieEscapeWatch()
-        if _zombieEscapeConn then return end
-        _zombieEscapeConn = RunService.Heartbeat:Connect(function()
-            if not State.AutoFarmEmerald then
-                _zombieEscapeConn:Disconnect()
-                _zombieEscapeConn = nil
-                _zombieEscapeActive = false
-                _zombieEscapeY = AUTOFARM_TARGET_Y
-                return
-            end
-
-            local char = LocalPlayer.Character
-            local hrp  = char and char:FindFirstChild("HumanoidRootPart")
-            if not (hrp and hrp.Parent) then return end
-
-            local hum = char:FindFirstChildOfClass("Humanoid")
-            if not (hum and hum.Health > 0) then return end
-
-            local rangeSq = AUTOFARM_ZOMBIE_ESCAPE_RANGE * AUTOFARM_ZOMBIE_ESCAPE_RANGE
-            local _, zombieHead = getClosestZombieInRange(hrp.Position, rangeSq)
-
-            if zombieHead then
-                -- Just raise the shared Y target — the tween loop picks it up
-                -- on its next step automatically, no stopping needed.
-                _zombieEscapeActive = true
-                _zombieEscapeY = zombieHead.Position.Y + AUTOFARM_ESCAPE_FLOAT_HEIGHT
-            else
-                _zombieEscapeActive = false
-                _zombieEscapeY = AUTOFARM_TARGET_Y
-            end
-        end)
-    end
-
-    local function stopZombieEscapeWatch()
-        if _zombieEscapeConn then
-            pcall(function() _zombieEscapeConn:Disconnect() end)
-            _zombieEscapeConn = nil
-        end
-        _zombieEscapeActive = false
-    end
-
-    local function fireVoteAndRespawn(statusMsg)
-        updateAutofarmStatus(statusMsg or "Voting & resetting...")
-        Workspace.Gravity = 196.2
-        setAutofarmNoclip(false)
-        if _autofarmTween then
-            pcall(function() _autofarmTween:Cancel() end)
-            _autofarmTween = nil
-        end
-        task.wait(0.5)
-        pcall(function()
-            local RS = game:GetService("ReplicatedStorage")
-            local voteRemote = RS
-                :WaitForChild("Remotes", 5)
-                :WaitForChild("Misc",    5)
-                :WaitForChild("VotePlayAgain", 5)
-            voteRemote:FireServer()
-        end)
-        updateAutofarmStatus("Vote fired! Waiting for respawn...")
-        task.wait(0.5)
-        pcall(function() LocalPlayer:LoadCharacter() end)
-        local waitStart = os_clock()
-        repeat task.wait(0.5) until
-            (LocalPlayer.Character and
-             LocalPlayer.Character:FindFirstChild("HumanoidRootPart") and
-             LocalPlayer.Character:FindFirstChildOfClass("Humanoid") and
-             LocalPlayer.Character:FindFirstChildOfClass("Humanoid").Health > 0)
-            or (os_clock() - waitStart) > 15
-        Workspace.Gravity = 0
-        updateAutofarmStatus("Respawned! Restarting farm cycle...")
-        task.wait(1)
-    end
-
     local function runAutoFarmLoop()
         if _autofarmRunning then return end
         _autofarmRunning = true
-        startZombieEscapeWatch()   -- begin zombie proximity escape on Heartbeat
 
         local oldGravity = Workspace.Gravity
         Workspace.Gravity = 0
@@ -4331,21 +4249,6 @@ do
                 local char = LocalPlayer.Character
                 local hrp = char and char:FindFirstChild("HumanoidRootPart")
                 if not hrp then task.wait(1); continue end
-
-                -- Detect death mid-farm: humanoid dead or character removed
-                local hum = char:FindFirstChildOfClass("Humanoid")
-                local isDead = (not hum)
-                    or (hum.Health <= 0)
-                    or (char:GetAttribute("Dead") == true)
-                if isDead then
-                    if State.AutoResetAndVote then
-                        fireVoteAndRespawn("Character died! Voting & respawning...")
-                    else
-                        updateAutofarmStatus("Character died! Waiting for respawn...")
-                        task.wait(3)
-                    end
-                    continue
-                end
 
                 local boxes = getAllPowerBoxes()
                 if #boxes == 0 then
@@ -4369,9 +4272,11 @@ do
                     local targetPos = getPowerBoxPosition(entry)
                     if not targetPos then continue end
 
-                    -- Pre-check: skip if already repaired (no prompt available)
-                    local prePrompt = findPromptInPowerBox(entry.PowerBox)
-                    if not prePrompt or not prePrompt.Enabled then
+                    -- Pre-check: wait up to 1.2 s for a prompt before deciding this box
+                    -- is already repaired. Fixes the "skipped a broken box" bug caused by
+                    -- the server not having sent the prompt instance yet.
+                    local prePrompt = waitForPrompt(entry.PowerBox, 1.2)
+                    if not prePrompt then
                         updateAutofarmStatus(string.format("%s already repaired, skipping...", entry.Tile.Name))
                         task.wait(0.1)
                         continue
@@ -4387,18 +4292,17 @@ do
                     hrp = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
                     if hrp then
                         hrp.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
-                        local snapY = _zombieEscapeY
                         if getAutofarmFlatDistance(hrp.Position, targetPos) > getAutofarmRadius() then
                             local standPos = getAutofarmStandPosition(hrp.Position, targetPos)
-                            hrp.CFrame = CFrame.new(standPos.X, snapY, standPos.Z) * hrp.CFrame.Rotation
+                            hrp.CFrame = CFrame.new(standPos.X, standPos.Y, standPos.Z) * hrp.CFrame.Rotation
                         else
-                            hrp.CFrame = CFrame.new(hrp.Position.X, snapY, hrp.Position.Z) * hrp.CFrame.Rotation
+                            hrp.CFrame = CFrame.new(hrp.Position.X, AUTOFARM_TARGET_Y, hrp.Position.Z) * hrp.CFrame.Rotation
                         end
                     end
 
-                    -- Check again after arriving - might already be repaired
-                    local arrivalPrompt = findPromptInPowerBox(entry.PowerBox)
-                    if not arrivalPrompt or not arrivalPrompt.Enabled then
+                    -- Check again after arriving - wait briefly for server to confirm state
+                    local arrivalPrompt = waitForPrompt(entry.PowerBox, 0.6)
+                    if not arrivalPrompt then
                         updateAutofarmStatus(string.format("%s already repaired, skipping...", entry.Tile.Name))
                         task.wait(0.1)
                         continue
@@ -4406,7 +4310,10 @@ do
 
                     updateAutofarmStatus(string.format("At %s - Triggering prompt...", entry.Tile.Name))
 
-                    -- Fire prompt, break early if prompt disappears (repair done)
+                    -- Fire the repair prompt in a tight loop until it disappears (repaired)
+                    -- or the timeout expires. Mobile gets a slightly longer wait per tick
+                    -- to avoid overloading a low-end CPU.
+                    local promptFireWait = isTouch and 0.2 or 0.12
                     local promptStart = os_clock()
                     while State.AutoFarmEmerald and (os_clock() - promptStart) < AUTOFARM_WAIT_TIME do
                         local prompt = findPromptInPowerBox(entry.PowerBox)
@@ -4414,8 +4321,10 @@ do
                             updateAutofarmStatus(string.format("%s repaired! Moving on...", entry.Tile.Name))
                             break
                         end
+                        -- Re-patch each iteration in case the server reset the prompt distances
+                        patchAutofarmPrompt(prompt)
                         triggerPrompt(prompt)
-                        task.wait(0.3)
+                        task.wait(promptFireWait)
                     end
 
                     if State.AutoFarmEmerald then
@@ -4435,7 +4344,45 @@ do
                     end
 
                     if allRepaired and State.AutoResetAndVote then
-                        fireVoteAndRespawn("All plants repaired! Voting & resetting...")
+                        updateAutofarmStatus("All plants repaired! Voting & resetting...")
+
+                        -- Restore gravity & collisions before reset
+                        Workspace.Gravity = oldGravity or 196.2
+                        setAutofarmNoclip(false)
+                        if _autofarmTween then
+                            pcall(function() _autofarmTween:Cancel() end)
+                            _autofarmTween = nil
+                        end
+
+                        -- Fire VotePlayAgain remote
+                        task.wait(0.5)
+                        pcall(function()
+                            local RS = game:GetService("ReplicatedStorage")
+                            local voteRemote = RS
+                                :WaitForChild("Remotes", 5)
+                                :WaitForChild("Misc",    5)
+                                :WaitForChild("VotePlayAgain", 5)
+                            voteRemote:FireServer()
+                        end)
+                        updateAutofarmStatus("Vote fired! Resetting character...")
+
+                        -- Reset character
+                        task.wait(0.5)
+                        pcall(function() LocalPlayer:LoadCharacter() end)
+
+                        -- Wait for character to fully load
+                        local waitStart = os_clock()
+                        repeat task.wait(0.5) until
+                            (LocalPlayer.Character and
+                             LocalPlayer.Character:FindFirstChild("HumanoidRootPart") and
+                             LocalPlayer.Character:FindFirstChildOfClass("Humanoid") and
+                             LocalPlayer.Character:FindFirstChildOfClass("Humanoid").Health > 0)
+                            or (os_clock() - waitStart) > 15
+
+                        -- Re-zero gravity for farming again
+                        Workspace.Gravity = 0
+                        updateAutofarmStatus("Respawned! Restarting farm cycle...")
+                        task.wait(1)
                     else
                         updateAutofarmStatus("Completed all plants. Restarting cycle...")
                         task.wait(1)
@@ -4446,7 +4393,6 @@ do
 
         Workspace.Gravity = oldGravity or 196.2
         setAutofarmNoclip(false)
-        stopZombieEscapeWatch()   -- stop zombie proximity escape
         if _autofarmTween then pcall(function() _autofarmTween:Cancel() end) end
         _autofarmTween = nil
         _autofarmRunning = false
@@ -4488,7 +4434,6 @@ do
                 updateAutofarmStatus("Starting...")
                 task.spawn(runAutoFarmLoop)
             else
-                stopZombieEscapeWatch()
                 if _autofarmTween then pcall(function() _autofarmTween:Cancel() end) end
             end
         end,
