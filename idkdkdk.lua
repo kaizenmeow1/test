@@ -3981,7 +3981,7 @@ end
 do
     local AUTOFARM_NORMAL_SPEED   = 30
     local AUTOFARM_CLIPPING_SPEED = 4
-    local AUTOFARM_TARGET_Y       = 2.5   -- lowered so player stands on the ground
+    local AUTOFARM_TARGET_Y       = 5
     local AUTOFARM_WAIT_TIME      = 3
     local AUTOFARM_STEP_SIZE      = 2
     local AUTOFARM_ARRIVE_DIST    = 1.5
@@ -3991,6 +3991,12 @@ do
     local _autofarmTween          = nil
     local _autofarmStatusLabel    = nil
     local _autofarmRunning        = false
+
+    -- Zombie escape system
+    local AUTOFARM_ZOMBIE_ESCAPE_RANGE  = 10   -- studs: if any zombie is this close, escape
+    local AUTOFARM_ESCAPE_FLOAT_HEIGHT  = 18   -- studs above zombie head to float to
+    local _zombieEscapeActive           = false
+    local _zombieEscapeConn             = nil
 
     local AUTOFARM_STRUCTURES_PATH = Workspace:FindFirstChild("Structures")
 
@@ -4202,10 +4208,89 @@ do
             _autofarmTween:Play()
             _autofarmTween.Completed:Wait()
 
+            -- Yield here until any zombie escape finishes before tweening again.
+            while _zombieEscapeActive and State.AutoFarmEmerald do
+                task.wait(0.1)
+            end
+
             if not State.AutoFarmEmerald then break end
         end
 
         return State.AutoFarmEmerald
+    end
+
+    -- Returns the closest zombie model and its head if within rangeSq.
+    local function getClosestZombieInRange(hrpPos, rangeSq)
+        refreshAuraTargetCache(false)
+        for i = 1, #AuraTargets do
+            local data = AuraTargets[i]
+            local model = data and data.Model
+            if model and model.Parent and SupportedTypes[model.Name] then
+                local hum, head = cacheAuraTargetParts(data)
+                if hum and hum.Health > 0 and head then
+                    local hp = head.Position
+                    local dx = hp.X - hrpPos.X
+                    local dy = hp.Y - hrpPos.Y
+                    local dz = hp.Z - hrpPos.Z
+                    if (dx*dx + dy*dy + dz*dz) <= rangeSq then
+                        return model, head
+                    end
+                end
+            end
+        end
+        return nil, nil
+    end
+
+    -- Heartbeat watcher: instantly floats the player above any zombie that
+    -- steps within AUTOFARM_ZOMBIE_ESCAPE_RANGE while autofarm is running.
+    local function startZombieEscapeWatch()
+        if _zombieEscapeConn then return end
+        _zombieEscapeConn = RunService.Heartbeat:Connect(function()
+            if not State.AutoFarmEmerald then
+                _zombieEscapeConn:Disconnect()
+                _zombieEscapeConn = nil
+                _zombieEscapeActive = false
+                return
+            end
+
+            local char = LocalPlayer.Character
+            local hrp  = char and char:FindFirstChild("HumanoidRootPart")
+            if not (hrp and hrp.Parent) then return end
+
+            local hum = char:FindFirstChildOfClass("Humanoid")
+            if not (hum and hum.Health > 0) then return end
+
+            local rangeSq = AUTOFARM_ZOMBIE_ESCAPE_RANGE * AUTOFARM_ZOMBIE_ESCAPE_RANGE
+            local _, zombieHead = getClosestZombieInRange(hrp.Position, rangeSq)
+
+            if zombieHead then
+                -- Cancel any active tween so we stop moving toward the zombie.
+                if _autofarmTween then
+                    pcall(function() _autofarmTween:Cancel() end)
+                    _autofarmTween = nil
+                end
+                -- Float above the zombie's head so melee can't reach the player.
+                local escapeY = zombieHead.Position.Y + AUTOFARM_ESCAPE_FLOAT_HEIGHT
+                local cf = hrp.CFrame
+                hrp.CFrame = CFrame.new(cf.X, math.max(escapeY, AUTOFARM_TARGET_Y), cf.Z) * cf.Rotation
+                hrp.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+                _zombieEscapeActive = true
+                updateAutofarmStatus("Zombie nearby! Floating to escape...")
+            else
+                if _zombieEscapeActive then
+                    updateAutofarmStatus("Zombie gone. Resuming...")
+                end
+                _zombieEscapeActive = false
+            end
+        end)
+    end
+
+    local function stopZombieEscapeWatch()
+        if _zombieEscapeConn then
+            pcall(function() _zombieEscapeConn:Disconnect() end)
+            _zombieEscapeConn = nil
+        end
+        _zombieEscapeActive = false
     end
 
     local function fireVoteAndRespawn(statusMsg)
@@ -4243,6 +4328,7 @@ do
     local function runAutoFarmLoop()
         if _autofarmRunning then return end
         _autofarmRunning = true
+        startZombieEscapeWatch()   -- begin zombie proximity escape on Heartbeat
 
         local oldGravity = Workspace.Gravity
         Workspace.Gravity = 0
@@ -4287,6 +4373,12 @@ do
 
                 for i, entry in ipairs(boxes) do
                     if not State.AutoFarmEmerald then break end
+
+                    -- Wait out any active zombie escape before traveling to next box.
+                    if _zombieEscapeActive then
+                        while _zombieEscapeActive and State.AutoFarmEmerald do task.wait(0.15) end
+                        if not State.AutoFarmEmerald then break end
+                    end
 
                     local targetPos = getPowerBoxPosition(entry)
                     if not targetPos then continue end
@@ -4367,6 +4459,7 @@ do
 
         Workspace.Gravity = oldGravity or 196.2
         setAutofarmNoclip(false)
+        stopZombieEscapeWatch()   -- stop zombie proximity escape
         if _autofarmTween then pcall(function() _autofarmTween:Cancel() end) end
         _autofarmTween = nil
         _autofarmRunning = false
@@ -4408,6 +4501,7 @@ do
                 updateAutofarmStatus("Starting...")
                 task.spawn(runAutoFarmLoop)
             else
+                stopZombieEscapeWatch()
                 if _autofarmTween then pcall(function() _autofarmTween:Cancel() end) end
             end
         end,
